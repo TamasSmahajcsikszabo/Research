@@ -1,0 +1,331 @@
+---
+title: "A reliabilitás új megközelítése a figyelmi torzítás kutatásában"
+output: 
+  flexdashboard::flex_dashboard:
+    theme: spacelabwwd2hé
+    social: menu
+    source: embed
+    
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(xlsx)
+library(tidyverse)
+library(forcats)
+library(lazyeval)
+library(ggthemes)
+library(plotly)
+library(rbokeh)
+
+# Data Import -------------------------------------------------------------
+### reading data:
+thresholded <- read.csv("thresholded.csv")
+sd_filtered <- read.csv("SD_filtered.csv")
+winsorized <- read.csv("winsorized_for_analysis.csv")
+tidied <- read.csv("original_dataset.csv")
+
+tidy_data <- function(data, ...){
+  require(tidyverse)
+  col = c(...)
+  indices <- vector("integer", length(col))
+  names <-  as_tibble(names(data)) %>% 
+    mutate(index = row_number())
+  
+  for (i in seq_along(col)) {
+    indices[[i]] <- names$index[[i]]
+  }
+  
+  selection <- colnames(data[-indices])
+  
+  tidied <- data %>%
+    gather(selection, key="trial", value="RT") %>% 
+    as_data_frame()
+  
+  tidied = as.data.frame(tidied) %>% distinct()
+  tidied
+  
+}
+ABV <- function (data, x) {
+  ICVC <- data %>%
+    mutate(trial = str_sub(trial, start=2, end=length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange(felvetel.eve, Subject, trial) %>%
+    group_by(felvetel.eve, Subject) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x)+1) %>%
+    ungroup() %>%
+    group_by(Subject, bin, Emotion, label) %>%
+    summarise(mean_RT = mean(RT, na.rm=TRUE)) %>%
+    spread(4:5, key=label, value=mean_RT) %>%
+    mutate(ICVC = Incongruent - Congruent)
+  
+  SD <- ICVC %>%
+    group_by(Subject, Emotion) %>%   
+    summarise(SD = sd(ICVC))
+  
+  ICVC <- 
+    ICVC %>% left_join(SD, by=c(Subject = "Subject", Emotion = "Emotion"))  
+
+  mean_rt <- data %>%
+    mutate(Subject = as.character(Subject)) %>%
+    mutate(trial = str_sub(trial, start=2, end=length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange(felvetel.eve, Subject, trial) %>%
+    group_by(felvetel.eve, Subject) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x)+1) %>%
+    ungroup() %>% 
+    group_by(Subject, bin, Emotion) %>%
+    summarise(mean_RT = mean(RT, na.rm=TRUE))
+  
+  mean_rt <- mean_rt %>% ungroup() %>% 
+    mutate(Subject = as.integer(Subject))
+  
+  ICVC <- ICVC %>%
+    left_join(mean_rt, by=c(Subject = "Subject", bin = "bin", Emotion = "Emotion")) %>%
+    mutate(SD = as.double(SD)) %>%
+    mutate(ABV = SD / mean_RT)
+  
+  ICVC
+}
+winsorize <- function(data, x, y, z, ...){
+  gc()
+  grouping = c(...)
+  winsorized <- data %>%
+    group_by_(grouping) %>%
+    mutate("25th" = quantile(RT, c(x), na.rm=TRUE),
+           "75th" = quantile(RT, c(y), na.rm=TRUE),
+           IQR = z * IQR(RT, na.rm=TRUE)) %>%
+    mutate(
+      upper = `75th` + IQR,
+      lower = `25th` - IQR
+    ) %>%
+    mutate(
+      above_upper = if_else(RT > upper, "above", "normal"),
+      below_lower = if_else(RT < lower, "below", "normal")) %>%
+    ungroup()
+  
+  ranked_upper <- winsorized %>%
+    filter(above_upper == "normal") %>%
+    group_by_(grouping) %>%
+    arrange(desc(RT)) %>%
+    top_n(1, RT) %>%
+    rename(upper_replacer = RT) %>%
+    select(grouping, upper_replacer) %>%
+    ungroup()
+  
+  ranked_lower <- winsorized %>%
+    filter(below_lower == "normal") %>%
+    group_by_(grouping) %>%
+    arrange((RT)) %>%
+    top_n(-1, RT) %>%
+    rename(lower_replacer = RT) %>%
+    select(grouping, lower_replacer) %>%
+    ungroup()
+  
+  winsorized_for_analysis <- 
+    winsorized %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT ) %>%
+    left_join(ranked_upper) %>%
+    left_join(ranked_lower)
+  
+  winsorized_for_analysis <- winsorized_for_analysis %>%
+    distinct() %>%
+    gather(3:116, key=trial, value=RT) %>%
+    mutate(RT = if_else(RT>upper_replacer, upper_replacer, RT),
+           RT = if_else(RT<lower_replacer, lower_replacer, RT)) %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT) 
+}
+threshold <- function(data, ...) {
+  lower_threshold <- c(...)
+  upper_threshold <- c(...)
+  
+  thresholded <- data %>%
+    filter(!RT %in% lower_threshold) %>%
+    filter(!RT %in% upper_threshold)
+  
+  thresholded <- thresholded %>%
+    spread(key=trial, value=RT )
+}
+SD_filter <- function(data, x, ...) {
+  grouping = c(...)
+  
+  SD <- data %>%
+    group_by_(grouping) %>%
+    mutate(SD = sd(RT, na.rm=TRUE)) %>%
+    ungroup() %>%
+    spread(key=trial, value=RT )
+  
+  data_for_analysis <- data %>%
+    spread(key=trial, value=RT) %>% 
+    left_join(SD) %>% as_tibble()
+  
+  SD_filtered <- data_for_analysis %>%
+    gather(3:116, key="trial", value="RT") %>%
+    filter(!RT > x*SD | !RT < -x*SD) %>% 
+    spread(key=trial, value=RT ) %>%
+    as_tibble() %>% 
+    select(-SD)
+}
+export <- function(data, filename, path, format) {
+  if (format == "excel") {
+    write.xlsx(data, filename, path, col.names =TRUE, row.names=FALSE)
+  } else if (format == "csv") {
+    write.csv(data, filename, path)
+  } else {}
+}
+
+wins_sum <- summary(winsorized$RT) %>% as.matrix() %>% as.data.frame()
+wins_sum <- wins_sum %>% mutate(variable = row.names(wins_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+
+SD_sum <- summary(sd_filtered$RT) %>% as.matrix()%>% as.data.frame()
+SD_sum <- SD_sum %>% mutate(variable = row.names(SD_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+
+thres_sum <- summary(thresholded$RT) %>% as.matrix() %>% as.data.frame()
+thres_sum <- thres_sum %>% mutate(variable = row.names(thres_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+```
+
+
+
+Bevezető
+===================================
+
+Adatok {data-orientation=columns}
+===================================
+Column
+-----
+ 
+### Az eredeti adatok 
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+original <- tidied %>% filter(!is.na(RT))
+
+par <- retimes::mexgauss(original$RT) %>% as.numeric()
+mean <- mean(original$RT, na.rm = TRUE)
+SD <- sd(original$RT, na.rm = TRUE)
+
+figure(title = "A reakcióidő a mintán tipikus ex-Gaussian eloszlást mutat",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság") %>%
+  ly_hist(RT, data = original, breaks = 200, color = "grey", alpha = 1) %>% 
+  ly_segments(x0 = 200, y0 =10400, x1 = 8000, y1=10400, type = 3, alpha = 1) %>% 
+  ly_segments(x0 = mean, y0 = 10250, y1 = 10550, x1 = mean) %>% 
+  ly_text(x = mean, y = 10600, text = paste0("m = ", round(mean, digits = 2), " ms")) %>% 
+  ly_segments(x0 =200, y0 = 10250, y1 = 10550, x1 = 200) %>% 
+  ly_segments(x0 =8000, y0 = 10250, y1 = 10550, x1 = 8000) %>% 
+  ly_segments(x0 = (mean +  SD), y0 = 10250, y1 = 10550, x1 = (mean +  SD)) %>% 
+  ly_text(x = (mean +  SD), y = 9850, text = paste0("s = ", round(SD, digits = 2), " ms")) %>% 
+  ly_text(x =6000, y = 10600, text = paste0("tau = ", round(par[3], digits = 2))) %>% 
+  ly_segments(x0 = mean, y0 = 10200, x1 = mean + SD, y1=10200, type = 3, alpha = 1) %>%
+  tool_box_select()
+```
+
+Column
+-----
+
+### Megjegyzés
+
+* A eloszlás a **normális** és az **exponenciális** megoszlások keveréke, mely három, az ábrán jelzett paraméterrel írható le.
+* A normális eloszlás **átlaga** és **szórása**, valamint az eloszlás jobb szárának görbületét (az exponenciális eloszlás átlaga és szórása szerint) leíró **tau paraméter** szükségesek az eloszlás leírásához.
+* Reakcióidő adatok esetében ez az eloszlás a jellemző, melynél a megoszlás bal fele kötött (bounded), viszont a jobb fele bármely értéket felvehet.
+
+### Adatelemzési megfontolások reakcióidőkkel (Whelan, 2008 nyomán)
+* Számos vizsgálat (lásd Wilcox, 2017) igazolja, hogy a centrális tendecián alapuló hagyományos megközelítés, mely gyakran ANOVA-t alkalmaz reakcióidőkben mutatkozó csoportközi kutatások kimutatására, az **átlagot** és a **szórást** veszi alapul, melyek pedig érzékenyek az eloszlásban meglévő outlierekre és hamis próbastatisztikákhoz vezetnek.
+Az un. *measure of location* és *measure of scale/dispersion* kérdésében érdemes robusztus változatokat használni, lásd Wilcox, 2017.
+* Gyakori az outlierek eltávolítása és a küszöbértékek mentén való szűrés, melynek elméleti háttere, hogy a 100 ms alatti válasz kevésnek vélt ingerészlelésre és arra adott válasz megszervezésére, e módszerek gyakran vezetnek valóban meglévő, szisztematikus variancia eltávolításához.
+* Átlagok és ANOVA helyett, a teljes eloszlás vizsgálatát javasolják.
+
+
+Adattisztítás {data-orientation=rows}
+=====================================  
+
+Row {data-height=900}
+------
+### Küszöbértékkel szűrt adatok  {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+thresholded <- thresholded %>% filter(!is.na(RT))
+
+figure(title = "A küszöbértékek mentén való metszés",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság", 
+       toolbar_location = "right") %>%
+  ly_hist(RT, data = thresholded, breaks = 200, color = "orange", alpha = 1) 
+```
+
+### Szórással szűrt adatok {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+sd_filtered<- sd_filtered %>% filter(!is.na(RT)) %>% unique()
+
+
+figure(title = "+/- 2 standard szórással történt szűrés",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság",
+       toolbar_location = "right")%>%
+  ly_hist(RT, data = sd_filtered, breaks = 200, color = "blue", alpha = 1)
+```
+
+### Winsorizált adatok {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+
+winsorized <- winsorized %>% filter(!is.na(RT))
+
+figure(title = "Winsorizálás",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság",
+       toolbar_location = "right")%>%
+  ly_hist(RT, data = winsorized, breaks = 200, color = "green", alpha = 1)
+```
+
+
+Row {data-height=400}
+------
+### Leíró paraméterek {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+
+knitr::kable(thres_sum)
+
+```
+* 200-300 ms és 2500 ms felett szűrtük ki az adatokat.
+* Jelentős adatcsökkenést eredményez, mely akár szisztematikus variancia kivonásával is járhat.
+
+### Leíró paraméterek {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+knitr::kable(SD_sum)
+```
+* A +/- 2 standard szóráson kívül eső értékeket szűrtük ki.
+
+### Leíró paraméterek {.no-padding}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+knitr::kable(wins_sum)
+```
+* Az adatokat Price(2015) módszertana szerint *winsorizáltuk*, melynek keretében:
+* a 25. és 75. quantilishez tartozó értékeken kívül eső tartományban
+* az IQR másfélszeresét meghaladó értékeket 0-ra állítottuk,
+* majd a még valid tartományban eső minimum és maximum értékekkel helyettesítettük.
+* Fontos, hogy nem a teljes adatmegoszlást, hanem személyek próbákra adott értékeit winsorizáltuk.
+
+Eredmények
+===================================
+```{r}
+
+#using the custom ABV formula
+#threshold_abv <- ABV(thresholded,29)%>% mutate(method = "threshold")
+#SD_filtering_abv <- ABV(SD_filtered,29) %>% mutate(method = "SD filtering")
+#winsorizing_abv <- ABV(winsorized,29) %>% as_tibble()%>% mutate(method = "winsorizing")
+#original_dataset_abv <- ABV(tidied,29)%>% mutate(method = "original dataset")
+
+#all_abv <- threshold_abv %>% 
+#  bind_rows(SD_filtering_abv) %>% 
+#  bind_rows(winsorizing_abv) %>% 
+#  bind_rows(original_dataset_abv)
+```
+
+Felhasznált irodalom
+===================================
+**Price, R. B., J. M. Kuckertz, G. J. Siegle, C. D. Ladouccer, J. S. Silk, N. D. Ryan, R. E. Dahl, N. Amir** (2015). "Empirical recommendations for improving the stability of the dot-probe task in clinical research." *Psychological Assessment* 27.(2.): 365-376.
+
+**Whelan, R.** (2008). Effective Analysis of Reaction Time Data. *The Psycholohical Record*, 58, 475-482.
+
+**Wilcox, R. R.** (2017). Introduction to Robust Estimation and Hypothesis Testing, *Elsevier*.

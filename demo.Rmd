@@ -1,0 +1,66 @@
+---
+title: "A reliabilitás új megközelítése a figyelmi torzítás kutatásában"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    social: menu
+    source_code: embed
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+library(flexdashboard)
+library(xlsx)
+library(tidyverse)
+library(forcats)
+library(lazyeval)
+library(ggthemes)
+library(plotly)
+library(rbokeh)
+
+thresholded <- read.csv("thresholded.csv")
+SD_filtered <- read.csv("SD_filtered.csv")
+winsorized <- read.csv("winsorized_for_analysis.csv")
+tidied <- read.csv("original_dataset.csv")
+
+original <- tidied %>% filter(!is.na(RT))
+```
+
+
+```{r}
+# Reactive that returns the whole dataset if there is no brush
+selectedData <- reactive({
+  data <- brushedPoints(original$RT, input$plot1_brush)
+  if (nrow(data) == 0)
+    data <- mtcars2
+  data
+})
+```
+
+Column {data-width=650}
+-----------------------------------------------------------------------
+
+### Az eredeti adatok {data-width=600}
+
+```{r}
+library(ggplot2)
+par <- retimes::mexgauss(original$RT) %>% as.numeric()
+
+plotOutput("plot1", brush = brushOpts(id = "plot1_brush"))
+output$plot1 <- renderPlot({
+ ggplot(original, aes(RT)) +
+  geom_histogram(colour = "black", fill = "lightgrey", binwidth = 100) +
+  labs(
+    title = paste("A reakcióidő a mintán tipikus ex-Gaussian eloszlást mutat"),
+    x = "Reakcióidő (ms)",
+    y = "Elemszám (n)"
+  ) +
+    xlim(original$RT < 2000) +
+  geom_segment(x = 200, y = 17000, xend = 1000, yend=17000, linetype = 3, size = 1, colour = "lightgrey") + 
+  geom_segment(x = mean(tidied$RT, na.rm = TRUE), y = 16850, yend = 17150, xend = mean(tidied$RT, na.rm = TRUE)) +
+  geom_segment(x =200, y = 16850, yend = 17150, xend = 200) +
+  geom_segment(x =1000, y = 16850, yend = 17150, xend = 1000) +
+  geom_segment(x = mean(tidied$RT, na.rm = TRUE) -  sd(tidied$RT, na.rm = TRUE), y = 16850, yend = 17150, xend = mean(tidied$RT, na.rm = TRUE) -  sd(tidied$RT, na.rm = TRUE))
+})
+```
+

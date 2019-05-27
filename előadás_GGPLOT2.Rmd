@@ -1,0 +1,671 @@
+---
+title: "A reliabilitás új megközelítése a figyelmi torzítás kutatásában"
+output:
+  ioslides_presentation: default
+  slidy_presentation: default
+  highlight: espresso
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(xlsx)
+library(tidyverse)
+library(forcats)
+library(lazyeval)
+library(ggthemes)
+library(plotly)
+library(rbokeh)
+library(viridis)
+library(e1071)
+
+# Data Import -------------------------------------------------------------
+### reading data:
+thresholded <- read.csv("thresholded.csv")
+sd_filtered <- read.csv("SD_filtered.csv")
+winsorized <- read.csv("winsorized_for_analysis.csv")
+tidied <- read.csv("original_dataset.csv")
+
+tidy_data <- function(data, ...){
+  require(tidyverse)
+  col = c(...)
+  indices <- vector("integer", length(col))
+  names <-  as_tibble(names(data)) %>% 
+    mutate(index = row_number())
+  
+  for (i in seq_along(col)) {
+    indices[[i]] <- names$index[[i]]
+  }
+  
+  selection <- colnames(data[-indices])
+  
+  tidied <- data %>%
+    gather(selection, key="trial", value="RT") %>% 
+    as_data_frame()
+  
+  tidied = as.data.frame(tidied) %>% distinct()
+  tidied
+  
+}
+ABV <- function (data, x) {
+  ICVC <- data %>%
+    mutate(trial = str_sub(trial, start=2, end=length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange(felvetel.eve, Subject, trial) %>%
+    group_by(felvetel.eve, Subject) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x)+1) %>%
+    ungroup() %>%
+    group_by(Subject, bin, Emotion, label) %>%
+    summarise(mean_RT = mean(RT, na.rm=TRUE)) %>%
+    spread(4:5, key=label, value=mean_RT) %>%
+    mutate(ICVC = Incongruent - Congruent)
+  
+  SD <- ICVC %>%
+    group_by(Subject, Emotion) %>%   
+    summarise(SD = sd(ICVC))
+  
+  ICVC <- 
+    ICVC %>% left_join(SD, by=c(Subject = "Subject", Emotion = "Emotion"))  
+
+  mean_rt <- data %>%
+    mutate(Subject = as.character(Subject)) %>%
+    mutate(trial = str_sub(trial, start=2, end=length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange(felvetel.eve, Subject, trial) %>%
+    group_by(felvetel.eve, Subject) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x)+1) %>%
+    ungroup() %>% 
+    group_by(Subject, bin, Emotion) %>%
+    summarise(mean_RT = mean(RT, na.rm=TRUE))
+  
+  mean_rt <- mean_rt %>% ungroup() %>% 
+    mutate(Subject = as.integer(Subject))
+  
+  ICVC <- ICVC %>%
+    left_join(mean_rt, by=c(Subject = "Subject", bin = "bin", Emotion = "Emotion")) %>%
+    mutate(SD = as.double(SD)) %>%
+    mutate(ABV = SD / mean_RT)
+  
+  ICVC
+}
+winsorize <- function(data, x, y, z, ...){
+  gc()
+  grouping = c(...)
+  winsorized <- data %>%
+    group_by_(grouping) %>%
+    mutate("25th" = quantile(RT, c(x), na.rm=TRUE),
+           "75th" = quantile(RT, c(y), na.rm=TRUE),
+           IQR = z * IQR(RT, na.rm=TRUE)) %>%
+    mutate(
+      upper = `75th` + IQR,
+      lower = `25th` - IQR
+    ) %>%
+    mutate(
+      above_upper = if_else(RT > upper, "above", "normal"),
+      below_lower = if_else(RT < lower, "below", "normal")) %>%
+    ungroup()
+  
+  ranked_upper <- winsorized %>%
+    filter(above_upper == "normal") %>%
+    group_by_(grouping) %>%
+    arrange(desc(RT)) %>%
+    top_n(1, RT) %>%
+    rename(upper_replacer = RT) %>%
+    select(grouping, upper_replacer) %>%
+    ungroup()
+  
+  ranked_lower <- winsorized %>%
+    filter(below_lower == "normal") %>%
+    group_by_(grouping) %>%
+    arrange((RT)) %>%
+    top_n(-1, RT) %>%
+    rename(lower_replacer = RT) %>%
+    select(grouping, lower_replacer) %>%
+    ungroup()
+  
+  winsorized_for_analysis <- 
+    winsorized %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT ) %>%
+    left_join(ranked_upper) %>%
+    left_join(ranked_lower)
+  
+  winsorized_for_analysis <- winsorized_for_analysis %>%
+    distinct() %>%
+    gather(3:116, key=trial, value=RT) %>%
+    mutate(RT = if_else(RT>upper_replacer, upper_replacer, RT),
+           RT = if_else(RT<lower_replacer, lower_replacer, RT)) %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT) 
+}
+threshold <- function(data, ...) {
+  lower_threshold <- c(...)
+  upper_threshold <- c(...)
+  
+  thresholded <- data %>%
+    filter(!RT %in% lower_threshold) %>%
+    filter(!RT %in% upper_threshold)
+  
+  thresholded <- thresholded %>%
+    spread(key=trial, value=RT )
+}
+SD_filter <- function(data, x, ...) {
+  grouping = c(...)
+  
+  SD <- data %>%
+    group_by_(grouping) %>%
+    mutate(SD = sd(RT, na.rm=TRUE)) %>%
+    ungroup() %>%
+    spread(key=trial, value=RT )
+  
+  data_for_analysis <- data %>%
+    spread(key=trial, value=RT) %>% 
+    left_join(SD) %>% as_tibble()
+  
+  SD_filtered <- data_for_analysis %>%
+    gather(3:116, key="trial", value="RT") %>%
+    filter(!RT > x*SD | !RT < -x*SD) %>% 
+    spread(key=trial, value=RT ) %>%
+    as_tibble() %>% 
+    select(-SD)
+}
+export <- function(data, filename, path, format) {
+  if (format == "excel") {
+    write.xlsx(data, filename, path, col.names =TRUE, row.names=FALSE)
+  } else if (format == "csv") {
+    write.csv(data, filename, path)
+  } else {}
+}
+
+wins_sum <- summary(winsorized$RT) %>% as.matrix() %>% as.data.frame()
+wins_sum <- wins_sum %>% mutate(variable = row.names(wins_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+
+SD_sum <- summary(sd_filtered$RT) %>% as.matrix()%>% as.data.frame()
+SD_sum <- SD_sum %>% mutate(variable = row.names(SD_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+
+thres_sum <- summary(thresholded$RT) %>% as.matrix() %>% as.data.frame()
+thres_sum <- thres_sum %>% mutate(variable = row.names(thres_sum)) %>% select(variable, V1) %>% spread(variable, V1)
+
+trial_types <- read.delim("trial_types.txt") %>% 
+  rename(trial = Trial)
+type_names <- tribble(
+  ~type, ~name,
+  "RpLe","Incongruent",
+  "RpRe","Congruent",
+  "LpRe","Incongruent",
+  "LpLe","Congruent"
+)
+
+emotions <- read.xlsx("probak_arcos_dotprobe.xlsx", sheetIndex = 1)
+emotions_adjusted <- emotions %>% select(TRIAL, Emotion) %>% 
+  mutate(TRIAL = paste("X", row_number(), sep="")) %>% 
+  rename("trial" = "TRIAL") %>% 
+  mutate(Emotion = fct_recode(Emotion,
+                            "sad" = "Sad"))%>% 
+  mutate(trial = as.numeric(str_sub(trial, start = 2, end = length(trial))))
+```
+
+## Bevezető és Módszer
+
+
+- **Hilt és Pollak (2013)** a rumináció legerősebb vonásának a háttérben meghúzódó szelektív figyelmi mechanizmust tartja, mely a negatív ingerekre irányuló figyelmi letapadás vagy azoktól való disztrakciós nehézséget jelenti. A jelenség kettős természetű:
+
+    - szelektív figyelmet jelent a negatív érzelmi töltetű, hangulatilag kongruens ingerekre;
+    - és megjelenhet a pozitív töltetű, inkongruens ingerekre irányuló figyelmi torzítás hiányában is.
+    
+
+- A ruminálók körében a pozitív érzelmi töltetű ingerekre mutatott, egyébként adaptív és normatív figyelmi torzítás alacsonyabb foka figyelhető meg. 
+
+## Az adatok {data-height=200, data-padding=10}
+
+A jelen munkában az  **Érzelmi Arcok Figyelmi Próba** segítségével nyert reakcióidőkön végzett robusztus adatelemzés eredményeit mutatom be, 
+
+- 333 serdülőtől (átlagéletkor: 16,09; szórás: 1,20) származó adatokkal. 
+
+- Az adatfelvétel során 144 próba esett egy vizsgálati személyre, ebből személyenként 57 inger kongruens volt, 57 inkongruens.
+
+- A 144 próba emellett harmadolva lett az érzelmi ingerek tekintetében is, 38-38 próba esett, szomorú, boldog és mérges ingerekre.
+
+## Az ABV-index  {data-height=400, data-padding=10}
+
+A figyelmi folyamatok vizsgálatánál, így a jelen kutatásban is használt *dot probe* tesztek révén nyert reakcióidő adatok azt mutatják, egyes csoportok, így 
+
+-* *ADHD-s gyerekek* (**Epstein et al, 2011**), 
+
+- *PTSD-vel diagnosztizált veteránok* (**Iacoviello et al, 2014**) esetén a személyen belüli variancia (az un. *attention bias variability*) magasabb releváns ingerek bemutatásakor (**Price at al, 2015**). 
+
+Az index jó stabilitással bír, így e tesztek esetén reliabilitási mutatóként is használható.
+
+Az ABV-index számítása  követte **Price (et al, 2015)** módszertanát, azaz a 114 próbát un. *bin*-ekre osztottuk, 29 bin alapján 4 tartománya volt képezhető a próbáknak. 
+
+- Minden személyre binenként számoltunk un. **ICvC-indexet**, mely az inkongurens ingerekre adott reackióidő és a kongruensekre adott válaszok  átlagainak különbségét jelentette. 
+
+- Következő lépésben a binenként ily módon nyert indexek standard szórását vettük, majd elosztottuk binenként a reakcióidő átlagával. Így egy személyen belüli, különböző binenként számított variabilitás indexet kaptunk, mely az elvárás szerint magas volt, ha a személy figyelme letapadt vagy adott inger elvonta azt.
+
+- A fenti munkától eltérően azonban, az ABV-indexeket személyenként és binenként az érzelmi ingerek tekintetében is vettük, arra keresve a választ, hogy adott érzelmi tartalmú  inger miként hat a figyelmi teljesítmény tekintetében.
+
+
+ 
+## Az eredeti adatok 
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+original <- tidied %>% filter(!is.na(RT))
+
+par <- retimes::mexgauss(original$RT) %>% as.numeric()
+mean = round(mean(original$RT, na.rm = TRUE),digits = 2)
+SD = round(sd(original$RT, na.rm = TRUE), digits = 2)
+tau = round(par[[3]], digits=2)
+
+figure(title = "A reakcióidő a mintán tipikus ex-Gaussian eloszlást mutat",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság", height = 1000, width = 1000) %>%
+  ly_hist(RT, data = original, breaks = 250, color = "grey", alpha = 1) %>% 
+  ly_segments(x0 = 200, y0 =10800, x1 = 8000, y1=10800, type = 3, alpha = 1) %>% 
+  ly_segments(x0 = mean, y0 = 10650, y1 = 10800, x1 = mean) %>% 
+  ly_text(x = mean, y = 10850, text = paste0("m = ", round(mean, digits = 2), " ms")) %>% 
+  ly_segments(x0 =200, y0 = 10650, y1 = 10800, x1 = 200) %>% 
+  ly_segments(x0 =8000, y0 = 10650, y1 = 10800, x1 = 8000) %>% 
+  ly_segments(x0 = (mean +  SD), y0 = 10650, y1 = 10800, x1 = (mean +  SD)) %>% 
+  ly_text(x = (mean +  SD), y = 10000, text = paste0("s = ", round(SD, digits = 2), " ms")) %>% 
+  ly_text(x =6000, y = 10850, text = paste0("tau = ", round(par[3], digits = 2), " ms")) %>% 
+  tool_box_select()
+
+```
+
+- A eloszlás a **normális** és az **exponenciális** megoszlások keveréke, mely három, az ábrán jelzett paraméterrel írható le.
+
+- A normális eloszlás **átlaga** és **szórása**, valamint az eloszlás jobb szárának görbületét (az exponenciális eloszlás átlaga és szórása szerint) leíró
+**tau paraméter** szükségesek az eloszlás leírásához.
+
+- Reakcióidő adatok esetében ez az eloszlás a jellemző, melynél a megoszlás bal fele kötött (bounded), viszont a jobb fele bármely értéket felvehet.
+
+## Adatelemzési megfontolások reakcióidőkkel (Whelan, 2008 nyomán)
+- Számos vizsgálat (lásd Wilcox, 2017) igazolja, hogy a centrális tendecián alapuló hagyományos megközelítés, mely gyakran ANOVA-t alkalmaz reakcióidőkben mutatkozó csoportközi kutatások kimutatására, az **átlagot** és a **szórást** veszi alapul, melyek pedig érzékenyek az eloszlásban meglévő outlierekre és hamis próbastatisztikákhoz vezetnek.
+Az un. *measure of location* és *measure of scale/dispersion* kérdésében érdemes robusztus változatokat használni, lásd Wilcox, 2017.
+
+- Gyakori az outlierek eltávolítása és a küszöbértékek mentén való szűrés, melynek elméleti háttere, hogy a 100 ms alatti válasz kevésnek vélt ingerészlelésre és arra adott válasz megszervezésére, e módszerek gyakran vezetnek valóban meglévő, szisztematikus variancia eltávolításához.
+
+- Átlagok és ANOVA helyett, a teljes eloszlás vizsgálatát javasolja **Whelan**, idézve olyan ADHD-s gyerekeken végzett vizsgálatot, melynél a hagyományos paramterikus eljárások az ADHD-s gyerekek elnyúlt reakcidőit igazolták kontroll csoporttal összevetésben, de ha külön elemzték az eloszlás Gaussian és exponenciális részeiben mutatkozó mintázatokat, az eredeti csoportközi különbség csak az előbbi eloszlásban  csak részbrn állta meg a helyét, az exponenciális eloszlás azt igazolta, hogy az ADHD-s gyerekek sokszor gyorsabbak, de hajlamosak figyelmi szinten letapadni. Az ilyen mintáztatokat a hagyományos módszerek nem érnek tetten **(Hervey, 2006; idézi: Whelan, 2008)**.
+
+
+## Küszöbértékkel szűrt adatok  {data-padding=10}
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+thresholded <- thresholded %>% filter(!is.na(RT))
+
+figure(title = "A küszöbértékek mentén való metszés",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság", 
+       toolbar_location = "right") %>%
+  ly_hist(RT, data = thresholded, breaks = 200, color = "grey", alpha = 1) 
+```
+
+Leíró paraméterek
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+
+knitr::kable(thres_sum)
+
+```
+- 200-300 ms és 2500 ms felett szűrtük ki az adatokat.
+- Jelentős adatcsökkenést eredményez, mely akár szisztematikus variancia kivonásával is járhat.
+
+## Szórással szűrt adatok {data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+sd_filtered<- sd_filtered %>% filter(!is.na(RT)) %>% unique()
+
+
+figure(title = "+/- 3 standard szórással történt szűrés",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság",
+       toolbar_location = "right")%>%
+  ly_hist(RT, data = sd_filtered, breaks = 200, color = "cadetblue", alpha = 1)
+```
+
+Leíró paraméterek 
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+knitr::kable(SD_sum)
+```
+- A +/- 3 standard szóráson kívül eső értékeket szűrtük ki.
+
+
+## Winsorizált adatok {data-padding=10}
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+
+winsorized <- winsorized %>% filter(!is.na(RT))
+
+figure(title = "Winsorizálás",
+       xlab = "Reakcióidő (ms)",
+       ylab = "Gyakoriság",
+       toolbar_location = "right")%>%
+  ly_hist(RT, data = winsorized, breaks = 200, color = "darkslateblue", alpha = 1)
+```
+
+Leíró paraméterek
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+knitr::kable(wins_sum)
+```
+- Az adatokat **Price (et al, 2015)** módszertana szerint *winsorizáltuk*, melynek keretében:
+  - a 25. és 75. quantilishez tartozó értékeken kívül eső tartományban
+  - az IQR másfélszeresét meghaladó értékeket 0-ra állítottuk,
+  - majd a még valid tartományban eső minimum és maximum értékekkel helyettesítettük.
+  
+- Fontos, hogy a teljes adatmegoszlást, nem személyen belüli értékeit winsorizáltuk.
+
+
+## Az adattisztítás mértékének számba vétele {data-height=200}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+datasets <- c("original", "winsorized_data", "SD_filtered_data", "thresholded_data") %>% as_tibble() %>% 
+  rename(names = value)
+
+original_sum <- summary(tidied$RT)
+thres_sum <- summary(thresholded$RT)
+SD_sum <- summary(sd_filtered$RT)
+wins_sum <- summary(winsorized$RT)
+
+original_n <- tidied %>% filter(!is.na(RT)) %>% summarise(n = n()) %>% mutate(names = "original")
+winsorized_data_n <- winsorized %>% filter(!is.na(RT)) %>% summarise(n = n(),
+                                                                                  delta = original_n$n - n,
+                                                                                  data_loss_ratio = paste0(round((delta/n)*100, digits=2),"%")) %>% mutate(names = "winsorized_data")
+SD_filtered_data_n <- sd_filtered %>% filter(!is.na(RT)) %>% summarise(n = n(), 
+                                                                       delta = original_n$n - n,
+                                                                       data_loss_ratio = paste0(round((delta/n)*100, digits=2),"%")) %>% mutate(names = "SD_filtered_data")
+thresholded_data_n <- thresholded %>% filter(!is.na(RT)) %>% summarise(n = n(),
+                                                                       delta = original_n$n - n,
+                                                                       data_loss_ratio = paste0(round((delta/n)*100, digits=2),"%")) %>% mutate(names = "thresholded_data")
+
+n_summary <- bind_rows(original_n, winsorized_data_n, SD_filtered_data_n, thresholded_data_n)
+
+summary <- bind_rows(original_sum, thres_sum, SD_sum, wins_sum)
+summary <- bind_cols(summary,datasets) %>% 
+  select(names, names(summary))
+
+summary_detail <- summary %>% left_join(n_summary) %>% 
+  mutate(Mean = round(Mean, digits = 2)) %>% 
+  rename("Különbség" = delta,
+         "Elemszám" = n,
+         "Adatveszteség (%)" = data_loss_ratio)
+
+DT::datatable(summary_detail)
+```
+
+Row
+-------
+
+### Megjegyzés
+
+* **Ratcliff** (1993; idézi: Baayen & Milin, 2010) irányelve szerint erős pozitív ferdeség esetén a megoszlás szárának erősségétől függően 5-15% -os adattisztítás indokolt, mely még nem fenyeget sem szisztematikus variancia eltávolításával, sem későbbi statisztikai próbák erejének csökkenésével.
+
+* A jelen kutatásban az eredeti adatokhoz képest, csak önmagában alkalmazva a +/- 3 standard szórás menti szűrés **`r SD_filtered_data_n[1,3]`** eredményezne, mely a fenti kritérium szerint még elfogadható.
+
+* A rögzített határértékek szerinti szűrés az eredeti adatok **`r thresholded_data_n[1,3]`** távolítaná el,  mely tekintettel a magas elemszámra még elfogadható.
+
+* Mivel a winsorizálás lényege, hogy a megadott kritériumok szerint előzesen outlier-ként azonosított adatokat nem eltávolítja, hanem újraskálázza, így ennek megfelelően esetünkben a 25. és 75. percentilishez tartozó adatok mint határértékek és az IQR 1.5-szeresének feltétele mellett az eltávolított adatok aránya **`r winsorized_data_n[1,3]`**
+
+* Fontos továbbá számba venni az adattisztítás ferdeségre gyakorolt hatását is, mivel főleg a **winsorizálás** esetén az újraskálázott adatok *quasi* bimodális jelleget kölcsönöznek az adateloszlásnak. Ezt demonstrálja az alábbi táblázat.
+
+### Az adattisztítás ferdeség-mutatókra gyakorolt hatása
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson ="setup"}
+library(caret)
+library(AppliedPredictiveModeling)
+RT_tidied <- tidied$RT
+original_skew <- round(skewness(RT_tidied, na.rm = TRUE), digits = 2) %>% as_tibble() %>% mutate(adat = "eredeti")
+
+RT_thresh <- thresholded$RT
+thresh_skew <- round(skewness(RT_thresh, na.rm = TRUE), digits = 2) %>% as_tibble() %>% mutate(adat = "küszöbbel szűrt")
+
+RT_SD <- sd_filtered$RT
+SD_skew <- round(skewness(RT_SD, na.rm = TRUE), digits = 2) %>% as_tibble() %>% mutate(adat = "szórással szűrt")
+
+RT_win <- winsorized$RT
+win_skew <- round(skewness(RT_win, na.rm = TRUE), digits = 2) %>% as_tibble() %>% mutate(adat = "winsorizált")
+
+skewness_summary <- tribble(
+  ~"adat", ~"ferdeség",
+  "eredeti", round(skewness(RT_tidied, na.rm = TRUE), digits = 2),
+  "küszöbbel szűrt",round(skewness(RT_thresh, na.rm = TRUE), digits = 2),
+  "szórással szűrt",round(skewness(RT_SD, na.rm = TRUE), digits = 2) ,
+  "winsorizált",round(skewness(RT_win, na.rm = TRUE), digits = 2)
+)
+
+DT::datatable(skewness_summary)
+```
+
+
+
+
+Eredmények
+===================================
+Column
+-------
+
+### Ruminálók explorációja {data-height=250, data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+ABV_data <- read.xlsx("results.xlsx", sheetIndex = 1)
+
+ABV_data_refined <- ABV_data %>% 
+  gather(3:14, key = measurement, value = score)
+
+ruminacio_data <- ABV_data %>% 
+  rename(NegA = NA.,
+         PosA = PA) %>%
+  select(Subject, Ruminacio, PosA, NegA, angry = winsorized_angry, happy = winsorized_happy, sad = winsorized_sad) %>% 
+  gather(5:7, key = erzelem, value = ABV) %>% 
+  ungroup()
+ruminacio_group <- ruminacio_data %>% 
+  mutate(group = if_else(Ruminacio <= (WRS::win(ruminacio_data$Ruminacio, tr = .25) - sqrt(WRS::winvar(ruminacio_data$Ruminacio, tr = .25))), "Alacsony",
+                         if_else(Ruminacio > (WRS::win(ruminacio_data$Ruminacio, tr = .25) + sqrt(WRS::winvar(ruminacio_data$Ruminacio, tr = .25))), "Magas", 
+                                 if_else(Ruminacio <= WRS::win(ruminacio_data$Ruminacio, tr = .25) & Ruminacio > (WRS::win(ruminacio_data$Ruminacio, tr = .25) - sqrt(WRS::winvar(ruminacio_data$Ruminacio, tr = .25))), "Win. Átlag alatt",
+                                         if_else(Ruminacio <= (WRS::win(ruminacio_data$Ruminacio, tr = .25) + sqrt(WRS::winvar(ruminacio_data$Ruminacio, tr = .25))) & Ruminacio > WRS::win(ruminacio_data$Ruminacio, tr = .25), "Win. Átlag felett",""))))) %>% 
+  mutate(group = factor(group, levels = unique(rev(group)))) %>% 
+  mutate(group = fct_relevel(group, "Alacsony", "Win. Átlag alatt", "Win. Átlag felett", "Magas"))
+
+ruminacio_group %>% 
+    filter(!is.na(Ruminacio),
+         !is.na(ABV)) %>% 
+  plot_ly(x = ~group, 
+          color = ~ group,
+          frame = ~erzelem,
+          colors = viridis_pal(option = "D")((3))) %>%
+  add_boxplot(y = ~ ABV)
+
+
+```
+
+Column
+-------
+### Pozitív affektivitás {data-height=250, data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+library(caret)
+library(AppliedPredictiveModeling)
+PA_group <- ruminacio_data %>% 
+  mutate(group = if_else(PosA <= (WRS::win(ruminacio_data$PosA, tr = .25) - sqrt(WRS::winvar(ruminacio_data$PosA, tr = .25))), "Alacsony",
+                         if_else(PosA > (WRS::win(ruminacio_data$PosA, tr = .25) + sqrt(WRS::winvar(ruminacio_data$PosA, tr = .25))), "Magas", 
+                                 if_else(PosA <= WRS::win(ruminacio_data$PosA, tr = .25) & PosA > (WRS::win(ruminacio_data$PosA, tr = .25) - sqrt(WRS::winvar(ruminacio_data$PosA, tr = .25))), "Win. Átlag alatt",
+                                         if_else(PosA <= (WRS::win(ruminacio_data$PosA, tr = .25) + sqrt(WRS::winvar(ruminacio_data$PosA, tr = .25))) & PosA > WRS::win(ruminacio_data$PosA, tr = .25), "Win. Átlag felett",""))))) %>% 
+  mutate(group = factor(group, levels = unique(rev(group)))) %>% 
+  mutate(group = fct_relevel(group, "Alacsony", "Win. Átlag alatt", "Win. Átlag felett", "Magas"))
+
+PA_group %>% 
+    filter(!is.na(Ruminacio),
+         !is.na(ABV)) %>% 
+  plot_ly(x = ~group, 
+          color = ~ group,
+          frame = ~erzelem,
+          colors = viridis_pal(option = "D")((3))) %>%
+  add_boxplot(y = ~ ABV)
+
+```
+
+Column
+-------
+### Negatív affektivitás {data-height=250, data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+library(caret)
+library(AppliedPredictiveModeling)
+NA_group <- ruminacio_data %>% 
+   mutate(group = if_else(NegA <= (WRS::win(ruminacio_data$NegA, tr = .25) - sqrt(WRS::winvar(ruminacio_data$NegA, tr = .25))), "Alacsony",
+                         if_else(NegA > (WRS::win(ruminacio_data$NegA, tr = .25) + sqrt(WRS::winvar(ruminacio_data$NegA, tr = .25))), "Magas", 
+                                 if_else(NegA <= WRS::win(ruminacio_data$NegA, tr = .25) & NegA > (WRS::win(ruminacio_data$NegA, tr = .25) - sqrt(WRS::winvar(ruminacio_data$NegA, tr = .25))), "Win. Átlag alatt",
+                                         if_else(NegA <= (WRS::win(ruminacio_data$NegA, tr = .25) + sqrt(WRS::winvar(ruminacio_data$NegA, tr = .25))) & NegA > WRS::win(ruminacio_data$NegA, tr = .25), "Win. Átlag felett",""))))) %>% 
+  mutate(group = factor(group, levels = unique(rev(group)))) %>% 
+  mutate(group = fct_relevel(group, "Alacsony", "Win. Átlag alatt", "Win. Átlag felett", "Magas"))
+
+
+NA_group %>% 
+    filter(!is.na(Ruminacio),
+         !is.na(ABV)) %>% 
+  plot_ly(x = ~group, 
+          color = ~ group,
+          frame = ~erzelem,
+          colors = viridis_pal(option = "D")((3))) %>%
+  add_boxplot(y = ~ ABV)
+
+
+```
+
+
+Eredmények II.
+===================================
+
+Column
+------
+
+### A figyelmi torzítás időbeli trendjei érzelmi ingerekre  {data-height=800, data-width=1000, data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+library(knitr)
+img_path = "C:/Users/tamas/OneDrive/Dokumentumok/Kutatás/rumi_np.png"
+include_graphics(img_path)
+```
+
+Column
+------
+### Megjegyzések {data-width=200, data-padding=10}
+* A magasan ruminálók körében a ABV-indexek binenkénti megoszlása alacsonyabb figyelemben megmutatkozó varianciát mutat.
+
+* Fontos ugyanakkor, hogy a **rumináló csoportok kialakítása** nem empirikus módszerrel, hanem önkényesen került kialakításra (winsorizált átlag és szórás értékeinek felhasználásával).
+
+* A ruminálók egyes csoportjai arányaikban hasonló elemszámmal bírnak.
+
+* A látszólagos varianca mögött kevés vizsgálatban résztvevő áll, a válaszadók többsége nem mutat nagy varianciát.
+
+### Az egyes alcsoportok jellemzői
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+
+x = 6
+ABV_data <- read.xlsx("results.xlsx", sheetIndex = 1)
+original_dataset <- tidied %>% 
+  mutate(trial = as.numeric(str_sub(trial, start = 2, end = length(trial))))
+
+original_dataset <- original_dataset %>% 
+  left_join(trial_types, by=c(trial = "trial")) %>% 
+  left_join(emotions_adjusted) %>% 
+  left_join(ABV_data, by = c(felvetel.eve = "felvetel.eve", Subject = "Subject")) %>% 
+  #select(-c(11:19))%>% 
+  rename(NegA = 'NA.',
+         PosA = PA)
+original_dataset <- original_dataset %>% 
+  filter(!is.na(Ruminacio)) %>% 
+  mutate(group = if_else(Ruminacio <= (WRS::win(original_dataset$Ruminacio, tr = .25) - sqrt(WRS::winvar(original_dataset$Ruminacio, tr = .25))), "Alacsony",
+                         if_else(Ruminacio > (WRS::win(original_dataset$Ruminacio, tr = .25) + sqrt(WRS::winvar(original_dataset$Ruminacio, tr = .25))), "Magas", 
+                                 if_else(Ruminacio <= WRS::win(original_dataset$Ruminacio, tr = .25) & Ruminacio > (WRS::win(original_dataset$Ruminacio, tr = .25) - sqrt(WRS::winvar(original_dataset$Ruminacio, tr = .25))), "Win. Átlag alatt",
+                                         if_else(Ruminacio <= (WRS::win(original_dataset$Ruminacio, tr = .25) + sqrt(WRS::winvar(original_dataset$Ruminacio, tr = .25))) & Ruminacio > WRS::win(original_dataset$Ruminacio, tr = .25), "Win. Átlag felett","")))),
+         groupN = if_else(NegA <= summary(NegA)[[2]], "Alacsony NegA",
+                         if_else(NegA >= summary(NegA)[[5]], "Magas NegA", "Átlagos NegA"))) %>% 
+  mutate(group = factor(group, levels = unique(rev(group)))) %>% 
+  mutate(group = fct_relevel(group, "Alacsony", "Win. Átlag alatt", "Win. Átlag felett", "Magas"))
+
+rumination_summary <- original_dataset %>% 
+  group_by(Csoport = group) %>% 
+  summarise(n = n_distinct(Subject),
+            win_mean =  round(WRS::win(Ruminacio, tr = .25), digits = 2),
+            win_sd =  round(sqrt(WRS::winvar(Ruminacio, tr = .25)), digits = 2)) %>% 
+  rename("Winsorizált átlag" = win_mean,
+         "Winsorizált SD" = win_sd)
+
+DT::datatable(rumination_summary)
+```
+
+Eredmények III. {data-orientaion=columns}
+===================================
+
+Column 
+------
+
+### A reakcióidő lag trendjei érzelmi ingerek mentén   {data-width=1000, data-padding=10}
+```{r echo=FALSE, message=FALSE, warning=FALSE, dependson="setup"}
+library(knitr)
+img_path = "C:/Users/tamas/OneDrive/Dokumentumok/Kutatás/lag.png"
+include_graphics(img_path)
+```
+
+Column 
+------
+### Megjegyzések {data-width=300, data-padding=10}
+
+* A reakcióidők lag-értékeinek jól elkülöníthető trendjei vannak az egyes érzelmi ingerekre nézve.
+
+* A trendek hasonlóak az egyes ruminációs alcsoportokban, noha fontos, hogy a trendeket winsorizált átlagokkal képeztük le a pontosabb centrális pont mérés miatt.
+
+* Ahogy arra **Baayen és Milin (2010)** utalnak, a reakcióidők változásának mértéke segíthet leképezni a tanulás vagy a fáradás jelenségét.
+
+
+### Következtetések
+
+* Az ABV-index mutat csoportközi eltéréseket, de **reliabilitás indexként** való használatához további, *retest* adatok szükségesek.
+
+* A reakcióidő adatok elemzéséhez támpontot adhatnak **Whelan (2008)** vagy **Baayen és Milin (2010)** munkái, melyek számba veszik az ilyen adatok elemzésénél felmerülő kihívásokat.
+
+* Kiemelendő, hogy noha a winsorizálás eredményes adattisztító módszernek mondható, mivel mind a **ferdeség**, mind az **adatok megőrzése** szempontjából kedvező mutatók jellemzik, ugyanakkor megváltoztatja az adatok megoszlását.
+
+* A hagyományos átlag és szórás helyett, érdemes **robusztus** paraméterekkel dolgozni, mint például a jelen munkában alkalmazott a winsorizált átlag és a winsorizált mintaszórás. 
+
+* A próbák sorrendjének randomizációja érdekes további adalékul szolgálhat (idézve a lag értékek trendjeit).
+
+* **Price** (et al, 2015) adattisztítási módszere kevésbé indokolt (a winsorizáláson túli 1.5-szeres IQR szükségességének kérdése).
+
+* Az a-priori adattisztítás mellett egy modellezést követő (modell kritika) utólagos outlier-kezelés is érdekes adalékul szolgálhat (**Baayen & Milin, 2010**).
+
+* Egységes adattisztítási elvek szükségessége: személyen belüli módszer a teljes minta helyett.
+
+Irodalom
+===================================
+
+### Felhaszált irodalom
+
+**Baayen, R.H. & Milin, P.** (2010). Analyzing Reaction Times. *International Journal of Psychological Research* Vol. 3, No. 2. http://revistas.usb.edu.co/index.php/IJPR/article/view/807 
+
+**Epstein, J. N.,  Langberg, J. M., P. J. Rosen, A. Graham, M. E. Narad, T. N. Antonini, W. B. Brinkham, T. Froehlich, J. I. Simon, M. Altaye** (2011). "Evidence for higher reaction time variability for children with ADHD on a range of cognitive tasks including reward and event rate manipulations." *Neuropsychology* 25.(4.): 427 - 441.
+
+**Hervey, A.S., Epstein J.N., Curry J.F., Tonev, S., Arnold, L.E., Conners, C.K., Hinshaw, S.P., Swanson, J.M., Hechtman, L.** (2006). Reaction time distribution analysis of neuropsychological performance in an ADHD sample. *Child Neuropsychology* 85, 197-216. (idézi: **Whelan, 2008**)
+
+**Hilt, L.M. & Pollak, S.D.** (2013). Characterizing the Ruminative Process in Young Adolescents. *Journal of Clinical Child and Adolescent Psychology* 42(4): 519-530.
+
+**Iacoviello, B. M., G. Wu, R. Abend, J. W. Murrough, A. Feder, E. Fruchter, Y. Levinstein, I. Wald, C. R. Bailey, D. S. P., A.Neumeister, Y. Bar - Haim, D. S. Charney** (2014). "Attention Bias Variability and Symptions of Posttraumatic Stress Disorder." *Journal of Trauma and Stress* 27.(2.): 232-239.
+
+**Price, R. B., J. M. Kuckertz, G. J. Siegle, C. D. Ladouccer, J. S. Silk, N. D. Ryan, R. E. Dahl, N. Amir** (2015). "Empirical recommendations for improving the stability of the dot-probe task in clinical research." *Psychological Assessment* 27.(2.): 365-376.
+
+**Ratcliff, R.** (1993). Methods of dealing with reaction time outliers. *Pychological Bulletin* 86, 446-461. (idézi: **Baayen & Milin, 2010**)
+
+**Whelan, R.** (2008). Effective Analysis of Reaction Time Data. *The Psycholohical Record*, 58, 475-482.
+
+**Wilcox, R. R.** (2017). Introduction to Robust Estimation and Hypothesis Testing, *Elsevier*.
+
+### R-package lista
+
+* xlsx
+* tidyverse
+* forcats
+* lazyeval
+* ggthemes
+* plotly
+* rbokeh
+* viridis
+* WRS
+* flexdashboard
+* caret
+* AppliedPredictiveModeling
+* e1071
+* DT

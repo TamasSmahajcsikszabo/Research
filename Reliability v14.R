@@ -1,0 +1,372 @@
+options(java.parameters = "-xmx6000m")
+
+# Libraries ---------------------------------------------------------------
+library(xlsx)
+library(tidyverse)
+library(ICC)
+library(forcats)
+library(lazyeval)
+
+# Data Import -------------------------------------------------------------
+### reading data:
+data <- read.xlsx("FaceDot2015_16_Tamasnak.xlsx", sheetIndex = 1) 
+
+### emotions:  
+emotions <- read.xlsx("probak_arcos_dotprobe.xlsx", sheetIndex = 1)
+emotions_adjusted <- emotions %>% select(TRIAL, Emotion) %>% 
+  mutate(TRIAL = paste("X", row_number(), sep="")) %>% 
+  rename("trial" = "TRIAL") %>% 
+  mutate(Emotion = fct_recode(Emotion,
+                            "sad" = "Sad"))
+
+### defining to be exlcuded inaccurate datasets:
+excluded_records <- c(300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319, 320, 321, 106, 109, 111, 119, 131, 159, 172, 438, 444, 121, 526, 555, 558, 572, 654, 677, 729, 812, 855, 856)
+
+### trimming off last two columns:
+data <- data[,1:116]
+
+# Functions ---------------------------------------------------------------
+tidy_data <- function(data, ...){
+  require(tidyverse)
+  col = c(...)
+  indices <- vector("integer", length(col))
+  names <-  as_tibble(names(data)) %>% 
+    mutate(index = row_number())
+  
+  for (i in seq_along(col)) {
+    indices[[i]] <- names$index[[i]]
+  }
+  
+  selection <- colnames(data[-indices])
+  
+  tidied <- data %>%
+    gather(selection, key="trial", value="RT") %>% 
+    as_data_frame()
+  
+  tidied = as.data.frame(tidied) %>% distinct()
+  tidied
+  
+}
+ICVC <- function(data, ...) {
+  grouping = c(...)
+  data %>% 
+    group_by_(grouping) %>%
+    summarise(mean_RT = mean(RT, na.rm=TRUE)) %>%
+    spread(2:3, key=label, value=mean_RT) %>%
+    mutate(ICVC = Incongruent - Congruent)}
+
+ABV <- function (data, x, y, z, ...) { 
+  grouping = c(...)
+  ICVC <- data %>%
+    mutate(trial = str_sub(trial, start = 2, end = length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange_(grouping[1], grouping[2], trial) %>%
+    group_by_(grouping) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x) + 1) %>%
+    ungroup() %>%
+    group_by(data[y], bin, data[z], label) %>%
+    summarise(mean_RT = mean(RT, na.rm = TRUE)) %>%
+    spread(4:5, key = label, value = mean_RT) %>%
+    mutate(ICVC = Incongruent - Congruent)
+  
+  SD <- ICVC %>%
+    group_by(Subject, Emotion) %>%   
+    summarise(SD = sd(ICVC))
+  
+  ICVC <- 
+    ICVC %>% left_join(SD, by=c(Subject = "Subject", Emotion = "Emotion"))  
+  
+  mean_rt <- data %>%
+    mutate(Subject = as.character(Subject)) %>%
+    mutate(trial = str_sub(trial, start=2, end=length(trial))) %>%
+    mutate(trial = as.integer(trial)) %>%
+    arrange_(grouping[1], grouping[2], trial) %>%
+    group_by_(grouping) %>%
+    mutate(index = row_number()) %>%
+    mutate(bin = (index %/% x) + 1) %>%
+    ungroup() %>% 
+    group_by(grouping[y], bin, data[z]) %>%
+    summarise(mean_RT = mean(RT, na.rm = TRUE))
+  
+  mean_rt <- mean_rt %>% ungroup() %>% 
+    mutate(Subject = as.integer(Subject))
+  
+  ICVC <- ICVC %>%
+    left_join(mean_rt, by = c(Subject = "Subject", bin = "bin", Emotion = "Emotion")) %>%
+    mutate(SD = as.double(SD)) %>%
+    mutate(ABV = SD / mean_RT)
+  
+  ICVC
+}
+
+winsorize <- function(data, x, y, z, ...){
+  gc()
+  grouping = c(...)
+  winsorized <- data %>%
+    group_by_(grouping) %>%
+    mutate("25th" = quantile(RT, c(x), na.rm=TRUE),
+           "75th" = quantile(RT, c(y), na.rm=TRUE),
+           IQR = z * IQR(RT, na.rm=TRUE)) %>%
+    mutate(
+      upper = `75th` + IQR,
+      lower = `25th` - IQR
+    ) %>%
+    mutate(
+      above_upper = if_else(RT > upper, "above", "normal"),
+      below_lower = if_else(RT < lower, "below", "normal")) %>%
+    ungroup()
+  
+  ranked_upper <- winsorized %>%
+    filter(above_upper == "normal") %>%
+    group_by_(grouping) %>%
+    arrange(desc(RT)) %>%
+    top_n(1, RT) %>%
+    rename(upper_replacer = RT) %>%
+    select(grouping, upper_replacer) %>%
+    ungroup()
+  
+  ranked_lower <- winsorized %>%
+    filter(below_lower == "normal") %>%
+    group_by_(grouping) %>%
+    arrange((RT)) %>%
+    top_n(-1, RT) %>%
+    rename(lower_replacer = RT) %>%
+    select(grouping, lower_replacer) %>%
+    ungroup()
+  
+  winsorized_for_analysis <- 
+    winsorized %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT ) %>%
+    left_join(ranked_upper) %>%
+    left_join(ranked_lower)
+  
+  winsorized_for_analysis <- winsorized_for_analysis %>%
+    distinct() %>%
+    gather(3:116, key=trial, value=RT) %>%
+    mutate(RT = if_else(RT>upper_replacer, upper_replacer, RT),
+           RT = if_else(RT<lower_replacer, lower_replacer, RT)) %>%
+    select(grouping, trial, RT) %>%
+    spread(key=trial, value=RT) 
+}
+threshold <- function(data, ...) {
+  lower_threshold <- c(...)
+  upper_threshold <- c(...)
+  
+  thresholded <- data %>%
+    filter(!RT %in% lower_threshold) %>%
+    filter(!RT %in% upper_threshold)
+  
+  thresholded <- thresholded %>%
+    spread(key=trial, value=RT )
+}
+SD_filter <- function(data, x, ...) {
+  grouping = c(...)
+  
+  SD <- data %>%
+    group_by_(grouping) %>%
+    mutate(SD = sd(RT, na.rm=TRUE)) %>%
+    ungroup() %>%
+    spread(key=trial, value=RT )
+  
+  data_for_analysis <- data %>%
+    spread(key=trial, value=RT) %>% 
+    left_join(SD) %>% as_tibble()
+  
+  SD_filtered <- data_for_analysis %>%
+    gather(3:116, key="trial", value="RT") %>%
+    filter(!RT > x*SD | !RT < -x*SD) %>% 
+    spread(key=trial, value=RT ) %>%
+    as_tibble() %>% 
+    select(-SD)
+}
+export <- function(data, filename, path, format) {
+  if (format == "excel") {
+    write.xlsx(data, filename, path, col.names =TRUE, row.names=FALSE)
+  } else if (format == "csv") {
+    write.csv(data, filename, path)
+  } else {}
+}
+
+# Data Cleansing ----------------------------------------------------------
+
+#1. excluding blue lines
+data_cleaned <- data %>% filter(!Subject %in% excluded_records)
+
+#2. removal of first three trials of each block
+###optional
+#data_cleaned <- data_cleaned[,c(1,2,6:116)]
+
+#3. tidying:
+tidied <- data_cleaned %>%
+  gather(3:116, key="trial", value="RT") %>% 
+  select(felvetel.eve, Subject, trial, RT)
+
+# 1. RT threshold -----------------------------------------------
+#declaring:
+lower_threshold <- c(200:300)
+upper_threshold <- c(2500:3000)
+
+#filtering:
+thresholded <- tidied %>%
+  filter(!RT %in% lower_threshold) %>%
+  filter(!RT %in% upper_threshold)
+
+#reshaping the dataset into original form
+thresholded <- thresholded %>%
+  spread(key=trial, value=RT )
+
+write.csv(thresholded, "RT_thresholded.csv", na="", row.names = FALSE)
+
+# 2. SD ranges ---------------------------------------------------------------
+#SD ranges
+#calculating SD
+SD <- tidied %>%
+  group_by(felvetel.eve, Subject) %>%
+  mutate(SD = sd(RT, na.rm=TRUE)) %>%
+  ungroup() %>%
+  spread(key=trial, value=RT )
+
+#matching original dataset with SDs
+data_for_analysis <- data_cleaned %>%
+ left_join(SD) %>% as_tibble()
+
+#definining SD ranges
+SD_filtered <- data_for_analysis %>%
+  gather(3:116, key="trial", value="RT") %>%
+  filter(!RT > 3*SD | !RT < -3*SD) %>% ### optional
+  filter(!RT > 2*SD | !RT < -2*SD) %>%
+  spread(key=trial, value=RT ) %>%
+  as_tibble() %>%
+  select(-SD)
+
+write.csv(SD_filtered, "SD_filtered.csv", na="", row.names = FALSE) 
+
+# 3. Winsorizing ------------------------------------------------------------
+winsorized <- tidied %>%
+  group_by(felvetel.eve, Subject) %>%
+  mutate("25th" = quantile(RT, c(.25), na.rm=TRUE),
+         "75th" = quantile(RT, c(.75), na.rm=TRUE),
+         IQR = 1.5 * IQR(RT, na.rm=TRUE)) %>%
+  mutate(
+    upper = `75th` + IQR,
+    lower = `25th` - IQR
+  ) %>%
+  mutate(
+  above_upper = if_else(RT > upper, "above", "normal"),
+  below_lower = if_else(RT < lower, "below", "normal")) %>%
+  ungroup()
+
+
+ranked_upper <- winsorized %>%
+  filter(above_upper == "normal") %>%
+  group_by(felvetel.eve, Subject) %>%
+  arrange(desc(RT)) %>%
+  top_n(1, RT) %>%
+  rename(upper_replacer = RT) %>%
+  select(felvetel.eve, Subject, upper_replacer) %>%
+  ungroup()
+
+ranked_lower <- winsorized %>%
+  filter(below_lower == "normal") %>%
+  group_by(felvetel.eve, Subject) %>%
+  arrange((RT)) %>%
+  top_n(-1, RT) %>%
+  rename(lower_replacer = RT) %>%
+  select(felvetel.eve, Subject, lower_replacer) %>%
+  ungroup()
+
+winsorized_for_analysis <- 
+  winsorized %>%
+  select(felvetel.eve, Subject, trial, RT) %>%
+  spread(key=trial, value=RT ) %>%
+  left_join(ranked_upper) %>%
+  left_join(ranked_lower)
+  
+winsorized_for_analysis <- winsorized_for_analysis %>%
+  distinct() %>%
+  gather(3:116, key=trial, value=RT) %>%
+  mutate(RT = if_else(RT>upper_replacer, upper_replacer, RT),
+         RT = if_else(RT<lower_replacer, lower_replacer, RT)) %>%
+  select(felvetel.eve, Subject, trial, RT) %>%
+  spread(key=trial, value=RT) 
+
+write.csv(winsorized_for_analysis, "winsorized.csv", na="", row.names = FALSE) 
+
+
+# Index calculations ------------------------------------------------------
+
+#trial name tidying
+trial_types <- read.delim("trial_types.txt")
+type_names <- tribble(
+  ~type, ~name,
+  "RpLe","Incongruent",
+  "RpRe","Congruent",
+  "LpRe","Incongruent",
+  "LpLe","Congruent"
+)
+
+#merging trial types with codenames
+trial_types <- trial_types %>%
+  left_join(type_names, by=c(Type="type"))
+
+#creating the proper trial codenames
+trial_types <- trial_types %>%
+  mutate(trial = paste("X", row_number(), sep="")) %>%
+  select(trial, Type, name) %>%
+  rename(type = Type) %>%
+  rename(label = name)
+
+#merging trial names and emotions with analytic datasets
+thresholded <- thresholded %>%
+  gather(3:116, key=trial, value=RT) %>%
+  left_join(trial_types, by=c(trial = "trial")) %>% 
+  left_join(emotions_adjusted)
+
+SD_filtered <- SD_filtered %>%
+  gather(3:116, key=trial, value=RT) %>%
+  left_join(trial_types, by=c(trial = "trial")) %>% 
+  left_join(emotions_adjusted)
+
+winsorized_for_analysis <- winsorized_for_analysis %>%
+  gather(3:116, key=trial, value=RT) %>%
+  left_join(trial_types, by=c(trial = "trial")) %>% 
+  left_join(emotions_adjusted)
+
+#using the custom `indices formula`
+#thresfhold <- ICVC(thresholded)
+#SD_filtering <- ICVC(SD_filtered)
+#winsorizing <- ICVC(winsorized_for_analysis)
+
+#using the custom ABV formula
+thresfhold_abv <- ABV(thresholded,29)
+SD_filtering_abv <- ABV(SD_filtered,29)
+winsorizing_abv <- ABV(winsorized_for_analysis,29) %>% as_tibble()
+
+
+# Export ------------------------------------------------------------------
+
+#merging methods and RTs together
+thresholded <- thresholded %>% mutate(method = "threshold")
+SD_filtered <- SD_filtered %>% mutate(method = "SD filtering")
+winsorized_for_analysis <- winsorized_for_analysis %>% mutate(method = "winsorizing")
+
+merge <- thresholded %>% rbind(SD_filtered) %>% rbind(winsorized_for_analysis) %>% 
+  mutate(flag = paste(method,Emotion, label, sep="_")) %>% group_by(felvetel.eve,Subject, flag) %>% 
+  summarise(RT_mean = mean(RT, na.rm = TRUE)) %>% 
+  spread(3:4, key=flag, value=RT_mean)
+
+merge <- thresholded %>% rbind(SD_filtered) %>% rbind(winsorized_for_analysis) %>% 
+  mutate(method = paste(method),
+        Emotion = paste(Emotion),
+        label = paste(label)) %>% group_by(felvetel.eve,Subject, method, Emotion, label) %>%
+  summarise(RT_mean = mean(RT, na.rm = TRUE))
+data <- as.data.frame(merge)
+write.xlsx(data, "result.xlsx", col.names =TRUE, row.names=FALSE)
+write.csv(data, "result.csv")
+write.csv(tidied, "tidied.csv")
+
+test <- winsorize(tidied, grouping = c("Subject", "felvetel.eve"))
+testing <- data.frame(test == winsorized_for_analysis) %>% 
+  filter(FALSE)
