@@ -1,8 +1,9 @@
 library(tidyverse)
 library(readxl)
 library(extrafont)
+extrafont::loadfonts()
 
-source('~/kitin/functions_dev.R', encoding = 'UTF-8')
+source('~/Documents/REPO/kitin/functions_dev.R')
 
 data <- read_xlsx("FaceDot2015_16_Tamasnak.xlsx", sheet = 1)
 data <- data[, c(1:116)]
@@ -46,7 +47,8 @@ winsorized_data %>%
        caption = "A reakcióidőket 1500 ms alá szűrtük a láthatóság végett") +
   xlim(0,1500) +
   theme(panel.grid = element_blank(),
-        text = element_text(size = 18, family = "Garamond", face = "bold")) + 
+        text = element_text(size = 17, family = "Garamond", face = "bold"),
+        legend.position = "bottom") + 
   scale_fill_manual(values = c("cornflowerblue", "coral")) + 
   geom_text(aes(x = max(winsorized$RT_win)+50, y= 200, label = paste0(round(max(winsorized$RT_win)), " ms")), family = "Garamond", size = 4) +
   geom_text(aes(x = min(winsorized$RT_win)-80, y= 200, label = paste0(round(min(winsorized$RT_win)), " ms")), family = "Garamond", size = 4)
@@ -77,7 +79,8 @@ sd_data %>%
        caption = "A reakcióidőket 1500 ms alá szűrtük a láthatóság végett") +
   xlim(0,1500) +
   theme(panel.grid = element_blank(),
-        text = element_text(size = 18, family = "Garamond", face = "bold")) + 
+        text = element_text(size = 17, family = "Garamond", face = "bold"),
+        legend.position = "bottom") + 
   scale_fill_manual(values = c("cornflowerblue", "coral")) + 
   geom_text(aes(x = as.numeric(min_max_sd[3,3]), y= 200, label = paste0(round(as.numeric(min_max_sd[3,3])), " ms")), family = "Garamond", size = 4) +
   geom_text(aes(x = as.numeric(min_max_sd[3,2]), y= 200, label = paste0(round(as.numeric(min_max_sd[3,2])), " ms")), family = "Garamond", size = 4)
@@ -99,15 +102,56 @@ boot_base_median <- bootstrap2(base_distribution, fun = "median", percentile = F
 boot_SD_filtered_mean <- bootstrap2(SD_filtered, fun = "mean", percentile = FALSE, seed = FALSE, trimming = FALSE)
 
 bootstrap_data <- data.frame(
-  "Alap eloszlás Átlag" = boot_base_mean,
-  "20% Trimmelt Átlag" = boot_trimmed_mean,
-  "20% Winsorizált Átlag" = boot_winsorized_mean,
-  "Szórással szűrt átlag" = boot_SD_filtered_mean
+  "alapeloszlás" = boot_base_mean,
+  "trimmelt" = boot_trimmed_mean,
+  "winsorizált" = boot_winsorized_mean,
+  "szórással szűrt" = boot_SD_filtered_mean
 ) %>% 
-  gather(1:4, key = "változó", value = "MoL")
+  gather(1:4, key = "MoL", value = "est")
 
 ggplot(bootstrap_data) +
-  geom_density(aes(x = MoL, group = változó, color = változó, linetype = változó, fill = változó), alpha = 1/10) +
+  geom_density(aes(x = est, group = MoL, color = MoL, linetype = MoL, fill = MoL), alpha = 1/3) +
   theme_grey() + 
+  labs(x = "Lokáció (átlag)",
+       y = "Denzitás",
+       title = "Bootstrap eloszlások átlagra, trimmelt átlagra, winsorizált átlagra") +
   theme(panel.grid = element_blank(),
-        text = element_text(size = 18, family = "Garamond", face = "bold"))
+        text = element_text(size = 16, family = "Garamond")) + 
+  scale_fill_manual(values = c("coral", "cornflowerblue", "coral4", "lawngreen")) +
+  scale_color_manual(values = c("coral", "cornflowerblue", "coral4", "lawngreen"))
+
+
+# Relationship ------------------------------------------------------------
+
+other <- read_xlsx("Kerdoives_FaceDot2015_16_Tamasnak.xlsx", sheet = 1)
+RT <- tidied
+trial_types <- read.delim("trial_types.txt")
+type_names <- tribble(
+  ~type, ~name,
+  "RpLe","Incongruent",
+  "RpRe","Congruent",
+  "LpRe","Incongruent",
+  "LpLe","Congruent"
+)
+
+#merging trial types with codenames
+trial_types <- trial_types %>%
+  left_join(type_names, by=c(Type="type"))
+
+#creating the proper trial codenames
+trial_types <- trial_types %>%
+  mutate(trial = paste(row_number(), sep="")) %>%
+  dplyr::select(trial, Type, name) %>%
+  rename(type = Type)
+RT <- RT %>% left_join(trial_types) %>% 
+  rename(year = `felvetel eve`)
+  # REAC functions
+source('~/Documents/REPO/REAC/R/functions.R')
+
+original_dataset_abv <- ABV(RT,
+                              grouping = c("year", "Subject"), 
+                              trial = "trial", 
+                              bin_width = 29, 
+                              value = "RT",
+                              type = c("Incongruent", "Congruent"), 
+                              ID = "Subject")
